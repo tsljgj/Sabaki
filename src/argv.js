@@ -4,6 +4,14 @@
 // Returns the file to open from process.argv, or null, skipping flags, the dev
 // "." entry, and the packaged app path.
 exports.getOpenFileFromArgv = function (argv) {
+  let isDirectory = (arg) => {
+    try {
+      return require('fs').statSync(arg).isDirectory()
+    } catch (err) {
+      return false
+    }
+  }
+
   let files = argv
     .slice(1)
     .filter(
@@ -11,7 +19,8 @@ exports.getOpenFileFromArgv = function (argv) {
         !arg.startsWith('-') &&
         arg !== '.' &&
         !arg.endsWith('.asar') &&
-        !arg.endsWith('.asar/'),
+        !arg.endsWith('.asar/') &&
+        !isDirectory(arg),
     )
 
   return files.length > 0 ? files[0] : null

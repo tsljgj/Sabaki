@@ -7,11 +7,19 @@ const {
   nativeImage,
   BrowserWindow,
   Menu,
+  globalShortcut,
+  screen,
 } = require('electron')
 const {resolve} = require('path')
 const i18n = require('./i18n')
 const setting = require('./setting')
 const updater = require('./updater')
+
+// The overlay is driven by timers in the main window, which stays behind the
+// Tencent Go window; don't let Chromium/macOS throttle it
+app.commandLine.appendSwitch('disable-renderer-backgrounding')
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')
 const {getOpenFileFromArgv} = require('./argv')
 
 let windows = []
@@ -34,6 +42,7 @@ function newWindow(path) {
       nodeIntegration: true,
       contextIsolation: false,
       sandbox: false,
+      backgroundThrottling: false,
       preload: resolve(__dirname, 'preload.js'),
       zoomFactor: setting.get('app.zoom_factor'),
     },
@@ -77,6 +86,56 @@ function newWindow(path) {
   window.loadURL(`file://${resolve(__dirname, '../index.html')}`)
 
   return window
+}
+
+// Transparent, click-through window drawn on top of the Tencent Go board
+
+let overlayWindow = null
+
+function dbg(msg) {
+  require('fs').appendFileSync(
+    require('os').homedir() + '/sabaki-overlay.log',
+    `${new Date().toISOString()} [main] ${msg}\n`,
+  )
+}
+
+function showOverlay() {
+  if (overlayWindow != null) return
+
+  let {x, y, width, height} = screen.getPrimaryDisplay().bounds
+
+  overlayWindow = new BrowserWindow({
+    x,
+    y,
+    width,
+    height,
+    transparent: true,
+    enableLargerThanScreen: true,
+    frame: false,
+    hasShadow: false,
+    focusable: false,
+    resizable: false,
+    movable: false,
+    skipTaskbar: true,
+    show: false,
+    webPreferences: {nodeIntegration: true, contextIsolation: false},
+  })
+
+  overlayWindow.setAlwaysOnTop(true, 'screen-saver')
+  // skipTransformProcessType keeps Sabaki in the Dock (otherwise macOS turns the
+  // whole app into a background agent)
+  overlayWindow.setVisibleOnAllWorkspaces(true, {
+    visibleOnFullScreen: true,
+    skipTransformProcessType: true,
+  })
+  overlayWindow.setIgnoreMouseEvents(true)
+  overlayWindow.once('ready-to-show', () => overlayWindow.showInactive())
+  overlayWindow.on('closed', () => (overlayWindow = null))
+  overlayWindow.loadURL(`file://${resolve(__dirname, '../overlay.html')}`)
+}
+
+function hideOverlay() {
+  if (overlayWindow != null) overlayWindow.close()
 }
 
 function buildMenu(props = {}) {
@@ -431,6 +490,41 @@ async function main() {
       setting.get('app.startup_check_updates_delay'),
     )
   }
+
+  ipcMain.on('overlay:set-visible', (evt, visible) => {
+    let key = setting.get('overlay.toggle_key')
+    dbg(`overlay:set-visible ${visible}`)
+
+    if (visible) {
+      showOverlay()
+
+      // Single key that shows/hides the circles while the overlay is armed
+      if (key) {
+        let ok = globalShortcut.register(key, () => {
+          dbg(`peek key fired`)
+          let window = windows.find((w) => w != null && !w.isDestroyed())
+          if (window != null) window.webContents.send('tencent-overlay-peek')
+        })
+        dbg(`registered peek key ${key}: ${ok}`)
+      }
+    } else {
+      hideOverlay()
+      if (key) globalShortcut.unregister(key)
+    }
+  })
+  ipcMain.on('overlay:data', (evt, payload) => {
+    if (overlayWindow != null && !overlayWindow.webContents.isLoading()) {
+      overlayWindow.webContents.send('overlay:data', payload)
+    }
+  })
+
+  let okToggle = globalShortcut.register('CommandOrControl+Alt+A', () => {
+    dbg('toggle shortcut fired')
+    let window = windows.find((w) => w != null && !w.isDestroyed())
+    if (window != null) window.webContents.send('tencent-overlay-toggle')
+  })
+  dbg(`registered toggle shortcut: ${okToggle}`)
+  app.on('will-quit', () => globalShortcut.unregisterAll())
 
   ipcMain.on('new-window', (evt, ...args) => newWindow(...args))
   ipcMain.on('build-menu', (evt, ...args) => buildMenu(...args))

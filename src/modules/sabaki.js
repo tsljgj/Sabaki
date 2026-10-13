@@ -1,6 +1,8 @@
 import fs from 'fs'
 import EventEmitter from 'events'
-import {basename, extname} from 'path'
+import os from 'os'
+import {spawn} from 'child_process'
+import {basename, extname, join} from 'path'
 import {ipcRenderer} from 'electron'
 import {h} from 'preact'
 import {v4 as uuid} from 'uuid'
@@ -641,6 +643,326 @@ class Sabaki extends EventEmitter {
     }
 
     this.setBusy(false)
+  }
+
+  // Live sync: mirror an SGF file that an external tool keeps rewriting
+
+  getLiveSyncFile() {
+    return join(os.homedir(), 'sabaki-live.sgf')
+  }
+
+  isLiveSyncing() {
+    return this.liveSyncFile != null
+  }
+
+  startLiveSync(filename = this.getLiveSyncFile()) {
+    this.stopLiveSync()
+    this.liveSyncFile = filename
+    this.liveSyncBusy = false
+
+    // Apply a new position only once it has stayed the same for two ticks, so
+    // that playing several moves in a row triggers one reload, not one per move
+    let reload = async (force = false) => {
+      if (this.liveSyncBusy) return
+      this.liveSyncBusy = true
+
+      try {
+        let content = fs.readFileSync(filename, 'utf8')
+        if (content === this.liveSyncContent) return
+
+        if (!force && content !== this.liveSyncPending) {
+          this.liveSyncPending = content
+          return
+        }
+
+        let gameTrees = fileformats.getModuleByExtension('sgf').parse(content)
+        if (gameTrees.length === 0) return
+        this.liveSyncContent = content
+
+        await this.loadGameTrees(gameTrees, {
+          suppressAskForSave: true,
+          clearHistory: true,
+        })
+        this.goToEnd()
+      } catch (err) {
+        // File missing or half-written, retry on next tick
+      } finally {
+        this.liveSyncBusy = false
+      }
+    }
+    this.liveSyncReload = reload
+
+    for (let stale of [filename, filename.replace(/\.sgf$/, '-board.json')]) {
+      try {
+        fs.unlinkSync(stale) // don't show a stale position
+      } catch (err) {}
+    }
+
+    this.liveSyncContent = null
+    this.liveSyncPending = null
+    this.liveSyncTimer = setInterval(() => reload(), 300)
+
+    // The recognizer screenshots the Tencent Go window and keeps `filename`
+    // up to date with the position it sees
+    let script = join(__dirname, 'tools', 'tencent-sync', 'sync.py').replace(
+      'app.asar',
+      'app.asar.unpacked',
+    )
+    let child = spawn('/usr/bin/python3', [script, '--out', filename], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+
+    child.stderr.on('data', (data) => (stderr += data))
+    child.on('error', (err) => (stderr += err.message))
+    child.on('exit', (code) => {
+      if (this.liveSyncChild !== child) return
+      this.liveSyncChild = null
+      this.stopLiveSync()
+      if (code) {
+        dialog.showMessageBox(
+          `Following Tencent Go stopped:\n${stderr.slice(-500)}`,
+          'warning',
+        )
+      }
+    })
+
+    this.liveSyncChild = child
+    window.addEventListener('beforeunload', () => child.kill())
+    this.setState({})
+  }
+
+  // Draw KataGo's analysis on top of the Tencent Go board
+
+  isOverlayOn() {
+    return this.overlayTimer != null
+  }
+
+  // Attach the first configured engine (if none is) and start analysing
+  async ensureAnalysis() {
+    let analyzeCommands = setting.get('engines.analyze_commands')
+    let findSyncer = () =>
+      this.state.attachedEngineSyncers.find((syncer) =>
+        analyzeCommands.some((x) => syncer.commands.includes(x)),
+      )
+
+    if (this.state.attachedEngineSyncers.length === 0) {
+      let engines = setting.get('engines.list')
+      if (engines.length === 0) {
+        await dialog.showMessageBox(
+          'Add an analysis engine (e.g. KataGo) in Preferences first.',
+          'warning',
+        )
+        return false
+      }
+      this.attachEngines([engines[0]])
+    }
+
+    let syncer = null
+    for (let i = 0; i < 120 && syncer == null; i++) {
+      syncer = findSyncer()
+      if (syncer == null) await helper.wait(500)
+    }
+    if (syncer == null) return false
+
+    await this.startAnalysis(syncer.id)
+    return true
+  }
+
+  async autoStartAnalysis() {
+    if (
+      !setting.get('analysis.auto_start') ||
+      setting.get('overlay.mode') === 'ondemand' ||
+      setting.get('engines.list').length === 0
+    ) {
+      return
+    }
+
+    await this.ensureAnalysis()
+  }
+
+  dbg(msg) {
+    fs.appendFileSync(
+      join(os.homedir(), 'sabaki-overlay.log'),
+      `${new Date().toISOString()} [renderer] ${msg}\n`,
+    )
+  }
+
+  getOverlayCells() {
+    let {analysis, analysisTreePosition, treePosition} = this.state
+
+    if (analysis == null || analysisTreePosition !== treePosition) return null
+    return this.makeOverlayCells(analysis)
+  }
+
+  makeOverlayCells(analysis) {
+    let top = [...analysis.variations]
+      .sort((a, b) => b.visits - a.visits)
+      .slice(0, setting.get('overlay.max_candidates'))
+    let best = top[0]
+    if (best == null) return null
+
+    return top.map((variation, i) => ({
+      rank: i + 1,
+      x: variation.vertex[0],
+      y: variation.vertex[1],
+      winrate: variation.winrate,
+      scoreLead: variation.scoreLead,
+      // Winrate lost compared to the engine's first choice
+      loss: Math.max(0, best.winrate - variation.winrate),
+      visits: variation.visits,
+      visitsRatio: variation.visits / best.visits,
+    }))
+  }
+
+  startOverlayLoop() {
+    if (this.overlayTimer != null) return
+
+    let geomFile = join(os.homedir(), 'sabaki-live-board.json')
+
+    this.overlayTimer = setInterval(() => {
+      let geom = null
+
+      try {
+        geom = JSON.parse(fs.readFileSync(geomFile, 'utf8'))
+      } catch (err) {
+        // board not visible: draw nothing
+      }
+
+      let cells = null
+
+      if (setting.get('overlay.mode') === 'ondemand') {
+        let frozen = this.overlayFrozen
+
+        if (frozen != null && frozen.treePosition === this.state.treePosition) {
+          cells = frozen.cells
+        } else if (this.overlayAnalyzing) {
+          cells = this.getOverlayCells() // preview while it is thinking
+        }
+      } else {
+        cells = this.getOverlayCells()
+      }
+
+      if (this.overlayHidden) cells = null
+
+      ipcRenderer.send('overlay:data', {geom, cells})
+    }, 200)
+
+    ipcRenderer.send('overlay:set-visible', true)
+    this.setState({})
+  }
+
+  async toggleTencentOverlay() {
+    let ondemand = setting.get('overlay.mode') === 'ondemand'
+    this.dbg(
+      `toggle mode=${ondemand ? 'ondemand' : 'live'} on=${this.isOverlayOn()} starting=${this.overlayStarting}`,
+    )
+
+    if (ondemand) return this.analyzeTencentOnce()
+
+    if (this.isOverlayOn()) return this.stopOverlay()
+    if (this.overlayStarting) return
+    this.overlayStarting = true
+
+    try {
+      if (!this.isLiveSyncing()) this.startLiveSync()
+      if (!(await this.ensureAnalysis())) return
+
+      this.startOverlayLoop()
+    } finally {
+      this.overlayStarting = false
+    }
+  }
+
+  // On-demand mode: read the board, analyse it for a few seconds, then freeze
+  // the result on screen and stop the engine
+  async analyzeTencentOnce() {
+    if (this.overlayStarting) return
+
+    let frozen = this.overlayFrozen
+    if (
+      this.isOverlayOn() &&
+      frozen != null &&
+      frozen.treePosition === this.state.treePosition
+    ) {
+      return this.stopOverlay() // pressed again on the same position
+    }
+
+    this.overlayStarting = true
+
+    try {
+      this.overlayFrozen = null
+      this.overlayHidden = false
+
+      if (!this.isLiveSyncing()) {
+        this.startLiveSync()
+        await helper.wait(2000) // let the first screenshot come in
+      } else {
+        await helper.wait(800) // let the recognizer settle on the latest move
+      }
+
+      this.liveSyncReload != null && (await this.liveSyncReload(true))
+      this.stopAnalysis()
+
+      let treePosition = this.state.treePosition
+      this.overlayAnalyzing = true
+      this.startOverlayLoop()
+
+      if (!(await this.ensureAnalysis())) return
+
+      let seconds = setting.get('overlay.ondemand_seconds')
+      let start = Date.now()
+
+      while (Date.now() - start < seconds * 1000) {
+        if (this.state.treePosition !== treePosition) return
+        await helper.wait(200)
+      }
+
+      if (this.state.treePosition !== treePosition) return
+
+      let {analysis, analysisTreePosition} = this.state
+      let cells =
+        analysis != null && analysisTreePosition === treePosition
+          ? this.makeOverlayCells(analysis)
+          : null
+
+      if (cells != null) this.overlayFrozen = {treePosition, cells}
+    } finally {
+      this.overlayAnalyzing = false
+      this.overlayStarting = false
+      this.stopAnalysis()
+    }
+  }
+
+  toggleOverlayCircles() {
+    this.dbg(`peek on=${this.isOverlayOn()} hidden=${this.overlayHidden}`)
+    if (this.isOverlayOn()) this.overlayHidden = !this.overlayHidden
+  }
+
+  stopOverlay() {
+    this.overlayHidden = false
+    this.overlayFrozen = null
+    clearInterval(this.overlayTimer)
+    this.overlayTimer = null
+    ipcRenderer.send('overlay:set-visible', false)
+    if (
+      setting.get('overlay.mode') === 'ondemand' ||
+      !setting.get('analysis.auto_start')
+    ) {
+      this.stopAnalysis()
+    }
+    this.setState({})
+  }
+
+  stopLiveSync() {
+    let child = this.liveSyncChild
+    this.liveSyncChild = null
+    if (child) child.kill()
+
+    clearInterval(this.liveSyncTimer)
+    this.liveSyncTimer = null
+    this.liveSyncFile = null
+    this.setState({})
   }
 
   async loadContent(content, extension, options = {}) {
@@ -1893,7 +2215,11 @@ class Sabaki extends EventEmitter {
             analysisTreePosition: syncer.treePosition,
           })
 
-          if (syncer.analysis != null && syncer.treePosition != null) {
+          if (
+            !this.isOverlayOn() &&
+            syncer.analysis != null &&
+            syncer.treePosition != null
+          ) {
             let tree = this.state.gameTrees[this.state.gameIndex]
             let {sign, winrate, scoreLead} = syncer.analysis
             if (sign < 0) {

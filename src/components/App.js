@@ -65,6 +65,15 @@ class App extends Component {
 
     window.addEventListener('load', () => {
       sabaki.events.emit('ready')
+      sabaki.autoStartAnalysis()
+    })
+
+    ipcRenderer.on('tencent-overlay-peek', () => {
+      sabaki.toggleOverlayCircles()
+    })
+
+    ipcRenderer.on('tencent-overlay-toggle', () => {
+      sabaki.toggleTencentOverlay()
     })
 
     ipcRenderer.on('load-file', (evt, ...args) => {

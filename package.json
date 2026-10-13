@@ -52,7 +52,8 @@
       "target": [
         "dmg"
       ],
-      "notarize": true,
+      "notarize": false,
+      "identity": null,
       "category": "public.app-category.board-games",
       "artifactName": "sabaki-v${version}-mac-${arch}.${ext}"
     },
@@ -85,6 +86,9 @@
         "name": "UGF",
         "description": "PandaNET UGF"
       }
+    ],
+    "asarUnpack": [
+      "tools/**"
     ],
     "files": [
       "**/*",

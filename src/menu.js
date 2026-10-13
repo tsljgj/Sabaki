@@ -82,6 +82,29 @@ exports.get = function (props = {}) {
         },
         {type: 'separator'},
         {
+          label: i18n.t('menu.file', '&Toggle Follow Tencent Go'),
+          enabled: !disableGameLoading,
+          click: () =>
+            sabaki.isLiveSyncing()
+              ? sabaki.stopLiveSync()
+              : sabaki.startLiveSync(),
+        },
+        {
+          label: i18n.t('menu.file', 'Toggle Tencent Go &Overlay'),
+          click: () => sabaki.toggleTencentOverlay(),
+        },
+        {
+          label: i18n.t('menu.file', 'Overlay: Analyze On &Demand Only'),
+          type: 'checkbox',
+          checked: setting.get('overlay.mode') === 'ondemand',
+          click: () => {
+            let ondemand = setting.get('overlay.mode') === 'ondemand'
+            if (sabaki.isOverlayOn()) sabaki.stopOverlay()
+            setting.set('overlay.mode', ondemand ? 'live' : 'ondemand')
+          },
+        },
+        {type: 'separator'},
+        {
           label: i18n.t('menu.file', '&Clipboard'),
           submenu: [
             {
